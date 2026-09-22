@@ -393,11 +393,10 @@ impl SessionManager {
         // A named session reaches the same directory every time the name is
         // used. An unnamed one works in a directory of its own, named after
         // the session.
-        let project = select_project(
-            &message.content,
-            &self.current_config().project_root,
-            &token,
-        );
+        // Pinned to startup: the thread index and every record live under
+        // the directories the daemon started with, so a reloaded root waits
+        // for a restart instead of scattering sessions across two trees.
+        let project = select_project(&message.content, &self.options.config.project_root, &token);
         let id = session_id(&project, &token);
         self.launch(id, project, message, ThreadKind::Created).await
     }
@@ -427,7 +426,7 @@ impl SessionManager {
 
         let project = select_project(
             &format!("{named}{}", request.prompt),
-            &self.current_config().project_root,
+            &self.options.config.project_root,
             &token,
         );
         self.launch(
@@ -518,7 +517,10 @@ impl SessionManager {
             };
         }
 
-        let state_dir = std::path::Path::new(&self.current_config().state_dir)
+        // Pinned to startup with the project root above: the registry path
+        // is fixed at construction, so new sessions stay where it can find
+        // them until a restart moves everything together.
+        let state_dir = std::path::Path::new(&self.options.config.state_dir)
             .join(&id)
             .display()
             .to_string();
@@ -529,7 +531,7 @@ impl SessionManager {
         let thread = match std::fs::create_dir_all(&home)
             .map_err(|error| error.to_string())
             .and_then(|()| {
-                ensure_project_directory(&project, &self.current_config().project_root)
+                ensure_project_directory(&project, &self.options.config.project_root)
                     .map_err(|error| error.to_string())
             }) {
             Err(error) => Err(error),

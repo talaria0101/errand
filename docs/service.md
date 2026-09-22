@@ -53,7 +53,14 @@ without killing any session:
 
 ```sh
 systemctl reload errand
+# without systemd, or without the shipped unit yet:
+kill -HUP $(cat /run/errand.pid)
 ```
+
+The shipped unit already carries the reload hook. After upgrading from a
+version before it, reinstall the unit, run `systemctl daemon-reload`, and
+restart once: the running daemon predates the hook, so the first reload
+still needs a restart to adopt it.
 
 A file that fails validation keeps the running configuration, and the refusal
 is logged naming every problem. A valid file swaps what new sessions start
