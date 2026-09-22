@@ -178,9 +178,13 @@ pub struct ManagerOptions {
 /// is, gathered once.
 struct Shared {
     scheduler: Arc<Scheduler>,
-    config: Config,
+    /// The running configuration. Swapped on reload, so new sessions and
+    /// routing decisions read the reloaded file rather than the startup one.
+    /// Sessions already running hold their own clone until the reload reaches
+    /// them over their command channel.
+    config: Mutex<Config>,
     log: Logger,
-    operator_ids: Vec<String>,
+    operator_ids: Mutex<Vec<String>>,
     memory: Option<Arc<MemoryStore>>,
     describe_images: Option<DescribeImages>,
     public_url: Option<String>,
@@ -205,21 +209,21 @@ pub struct SessionManager {
     options: ManagerOptions,
     shared: Arc<Shared>,
     state: Arc<ManagerState>,
-    secrets: Vec<String>,
 }
 
 impl SessionManager {
     /// Builds a manager over the given connections and stores.
     pub fn new(options: ManagerOptions) -> Self {
-        let secrets = secret_values(&options.config);
         let shared = Arc::new(Shared {
             scheduler: Arc::clone(&options.scheduler),
-            config: options.config.clone(),
+            config: Mutex::new(options.config.clone()),
             log: options.log.clone(),
-            operator_ids: options
-                .operator_ids
-                .clone()
-                .unwrap_or_else(|| options.config.chat.operator_user_ids.clone()),
+            operator_ids: Mutex::new(
+                options
+                    .operator_ids
+                    .clone()
+                    .unwrap_or_else(|| options.config.chat.operator_user_ids.clone()),
+            ),
             memory: options.memory.clone(),
             describe_images: options.describe_images.clone(),
             public_url: options.public_url.clone(),
@@ -242,8 +246,57 @@ impl SessionManager {
                 ended_threads: Mutex::new(HashSet::new()),
                 views: Mutex::new(HashMap::new()),
             }),
-            secrets,
         }
+    }
+
+    /// The configuration new sessions and routing decisions read.
+    ///
+    /// Cloned out from under a plain mutex, so callers never hold the lock
+    /// across an await. Reload swaps what this returns; running sessions
+    /// keep their own clone until the reload is sent to each of them.
+    pub fn current_config(&self) -> Config {
+        self.shared
+            .config
+            .lock()
+            .expect("the current configuration lock")
+            .clone()
+    }
+
+    /// Swaps the running configuration and carries it to every live session.
+    ///
+    /// Returns how many live sessions took it. Measured limits go live at
+    /// once inside each session; sizes and grants baked into a running
+    /// sandbox wait for its next launch. A reload that fails validation never
+    /// reaches here, so what is held is always a configuration the daemon
+    /// would have started from.
+    pub async fn reconfigure(&self, config: Config) -> usize {
+        let operator_ids = self
+            .options
+            .operator_ids
+            .clone()
+            .unwrap_or_else(|| config.chat.operator_user_ids.clone());
+        *self
+            .shared
+            .config
+            .lock()
+            .expect("the current configuration lock") = config.clone();
+        let operator_ids = {
+            let mut held = self
+                .shared
+                .operator_ids
+                .lock()
+                .expect("the operator list lock");
+            *held = operator_ids;
+            held.clone()
+        };
+        let mut updated = 0;
+        for session in self.sessions() {
+            session
+                .reconfigure(config.clone(), operator_ids.clone())
+                .await;
+            updated += 1;
+        }
+        updated
     }
 
     /// Records the guild, once the gateway has resolved it.
@@ -340,7 +393,11 @@ impl SessionManager {
         // A named session reaches the same directory every time the name is
         // used. An unnamed one works in a directory of its own, named after
         // the session.
-        let project = select_project(&message.content, &self.options.config.project_root, &token);
+        let project = select_project(
+            &message.content,
+            &self.current_config().project_root,
+            &token,
+        );
         let id = session_id(&project, &token);
         self.launch(id, project, message, ThreadKind::Created).await
     }
@@ -370,7 +427,7 @@ impl SessionManager {
 
         let project = select_project(
             &format!("{named}{}", request.prompt),
-            &self.options.config.project_root,
+            &self.current_config().project_root,
             &token,
         );
         self.launch(
@@ -404,14 +461,14 @@ impl SessionManager {
         // is a thread to type `!model` in, the session has already started on
         // another. Read before the window is checked: which provider this
         // runs on decides whose window matters, and another provider's being
-        // spent is not a reason to refuse work this one can do.
+        // spent is not a reason to refuse work this one can do. Bound once:
+        // the provider table is borrowed below, so a temporary would not live
+        // long enough.
+        let config = self.current_config();
         let asked = select_model(&project.prompt);
-        let known = known_providers(&self.options.config.agent);
+        let known = known_providers(&config.agent);
         let chosen = asked.value.as_ref().map(|value| {
-            let mut resolved = resolve_model(
-                &expand_alias(value, &self.options.config.agent.aliases),
-                &known,
-            );
+            let mut resolved = resolve_model(&expand_alias(value, &config.agent.aliases), &known);
             // A bare model id names no provider, so it would otherwise start
             // on the default one and reach the wrong endpoint. Find which
             // provider actually serves it.
@@ -420,7 +477,7 @@ impl SessionManager {
                 resolved.provider = provider_for(
                     &self.options.available_models,
                     &bare,
-                    &self.options.config.agent.provider,
+                    &config.agent.provider,
                 );
             }
             resolved
@@ -433,7 +490,7 @@ impl SessionManager {
         let provider_for_window = chosen
             .as_ref()
             .and_then(|chosen| chosen.provider.clone())
-            .unwrap_or_else(|| self.options.config.agent.provider.clone());
+            .unwrap_or_else(|| self.current_config().agent.provider.clone());
         if let Some(spent) = self.unavailable(&provider_for_window).await {
             return StartOutcome::Refused { reason: spent };
         }
@@ -461,7 +518,7 @@ impl SessionManager {
             };
         }
 
-        let state_dir = std::path::Path::new(&self.options.config.state_dir)
+        let state_dir = std::path::Path::new(&self.current_config().state_dir)
             .join(&id)
             .display()
             .to_string();
@@ -472,7 +529,7 @@ impl SessionManager {
         let thread = match std::fs::create_dir_all(&home)
             .map_err(|error| error.to_string())
             .and_then(|()| {
-                ensure_project_directory(&project, &self.options.config.project_root)
+                ensure_project_directory(&project, &self.current_config().project_root)
                     .map_err(|error| error.to_string())
             }) {
             Err(error) => Err(error),
@@ -538,7 +595,7 @@ impl SessionManager {
             )),
             launcher: Arc::clone(&self.shared.launcher),
             scheduler: Arc::clone(&self.shared.scheduler),
-            config: self.shared.config.clone(),
+            config: self.current_config(),
             log: self.shared.log.clone(),
             timers: None,
             owner_id: message.author_id.clone(),
@@ -551,7 +608,12 @@ impl SessionManager {
             available_models: self.shared.available_models.clone(),
             delegate_base_url: self.shared.delegate_base_url.clone(),
             unavailable: self.shared.unavailable.clone(),
-            operator_ids: self.shared.operator_ids.clone(),
+            operator_ids: self
+                .shared
+                .operator_ids
+                .lock()
+                .expect("the operator list lock")
+                .clone(),
             guest_ids: Vec::new(),
             on_guests_changed: Some(on_guests_changed(&self.shared.registry, &thread.id)),
             on_model_changed: Some(on_model_changed(&self.shared.registry, &thread.id)),
@@ -718,7 +780,7 @@ impl SessionManager {
             )),
             launcher: Arc::clone(&self.shared.launcher),
             scheduler: Arc::clone(&self.shared.scheduler),
-            config: self.shared.config.clone(),
+            config: self.current_config(),
             log: self.shared.log.clone(),
             timers: None,
             owner_id: record.owner_id.clone(),
@@ -731,7 +793,12 @@ impl SessionManager {
             available_models: self.shared.available_models.clone(),
             delegate_base_url: self.shared.delegate_base_url.clone(),
             unavailable: self.shared.unavailable.clone(),
-            operator_ids: self.shared.operator_ids.clone(),
+            operator_ids: self
+                .shared
+                .operator_ids
+                .lock()
+                .expect("the operator list lock")
+                .clone(),
             guest_ids: record.guests.clone(),
             on_guests_changed: Some(on_guests_changed(&self.shared.registry, thread_id)),
             // A thread that has been resumed can still be moved to another
@@ -781,10 +848,12 @@ impl SessionManager {
     /// handed to the agent as a file it can read, so a session reading its
     /// own prompt back would otherwise report them.
     fn reported_secrets(&self) -> Vec<String> {
-        match house_rules_text(self.options.config.agent.rules_path.as_deref()) {
-            None => self.secrets.clone(),
+        let config = self.current_config();
+        let secrets = secret_values(&config);
+        match house_rules_text(config.agent.rules_path.as_deref()) {
+            None => secrets,
             Some(rules) => {
-                let mut all = self.secrets.clone();
+                let mut all = secrets;
                 all.push(rules);
                 all
             }

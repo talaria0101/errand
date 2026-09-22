@@ -2883,3 +2883,27 @@ fn a_fetch_error_is_reported_with_its_whole_cause_chain() {
          dns error: failed to lookup address"
     );
 }
+
+/// A reloaded disk budget is measured at the next check, with no restart.
+#[tokio::test]
+async fn a_reloaded_disk_budget_reaches_a_running_session() {
+    with_session(SessionTestCase::default(), |harness| {
+        Box::pin(async move {
+            assert!(!harness.session.is_ended().await);
+            std::fs::write(
+                harness.root.path().join("project").join("hefty.bin"),
+                vec![7u8; 64],
+            )
+            .expect("the project gains weight");
+            let mut config = (*config_with(&json!({}))).clone();
+            config.sandbox.disk = "1b".to_owned();
+            harness.session.reconfigure(config, Vec::new()).await;
+            harness.timers.advance(60_000);
+            settle().await;
+
+            assert_eq!(*harness.ended.lock().unwrap(), [EndReason::ResourceLimit]);
+            assert!(harness.thread.everything().contains("past its"));
+        })
+    })
+    .await;
+}

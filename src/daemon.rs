@@ -297,6 +297,16 @@ impl Daemon {
         self.accepting.load(Ordering::SeqCst)
     }
 
+    /// Swaps the running configuration after a reload.
+    ///
+    /// Returns how many live sessions took it. Structural settings stay with
+    /// the objects built at startup until the daemon restarts; everything
+    /// else goes live or waits for the next launch, as the reload report
+    /// says.
+    pub async fn reconfigure(&self, config: Config) -> usize {
+        self.sessions.reconfigure(config).await
+    }
+
     /// Checks the backend and reports what it can enforce here.
     ///
     /// Fails with [`StartError`] when the backend cannot run here, or when
@@ -352,7 +362,7 @@ impl Daemon {
             return None;
         }
 
-        let allowed = &self.options.config.shutdown.allowed_user_ids;
+        let allowed = self.sessions.current_config().shutdown.allowed_user_ids;
         if allowed.is_empty() {
             return Some(
                 "nobody may power off this host; set shutdown.allowedUserIds to change that"

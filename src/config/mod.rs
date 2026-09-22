@@ -11,6 +11,8 @@ use std::path::{Component, Path, PathBuf};
 pub mod load;
 /// Removes secrets from anything about to leave the daemon.
 pub mod redact;
+/// Re-reads the file without restarting, and says when each change lands.
+pub mod reload;
 /// The shape of a resolved configuration, and its defaults.
 pub mod schema;
 /// Reads a byte size written the way people write one.

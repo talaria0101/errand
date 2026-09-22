@@ -33,6 +33,11 @@ Environment=HOME=/var/lib/errand
 Restart=on-failure
 RestartSec=5
 
+# Re-reads the configuration file without killing any session. A file that
+# fails validation keeps the running configuration; structural settings wait
+# for a restart, as the reload report in the log says.
+ExecReload=/bin/kill -HUP $MAINPID
+
 # Startup refuses on bad configuration (exit 2), an unenforceable isolation
 # guarantee (exit 3), or another daemon already running (exit 4). Restarting
 # would only repeat the refusal, and in the last case would fight the daemon

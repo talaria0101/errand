@@ -164,7 +164,11 @@ pub struct GatewayHandlers {
 
 /// Owns the single connection and dispatches filtered messages.
 pub struct Gateway {
-    config: ChatConfig,
+    /// Who may post and what starts a session. Swapped on reload, so an
+    /// edited allowlist takes effect on the next message without a restart.
+    /// The token and the served channel stay from startup: those are the
+    /// connection itself, not its filter.
+    config: std::sync::Mutex<ChatConfig>,
     handlers: Arc<GatewayHandlers>,
     log: Logger,
     give_up: std::sync::Mutex<GiveUp>,
@@ -183,7 +187,7 @@ impl Gateway {
     pub fn new(config: ChatConfig, handlers: GatewayHandlers, log: Logger) -> Arc<Self> {
         let (ready_sender, ready) = tokio::sync::watch::channel(false);
         Arc::new(Self {
-            config,
+            config: std::sync::Mutex::new(config),
             handlers: Arc::new(handlers),
             log,
             give_up: std::sync::Mutex::new(GiveUp::new()),
@@ -192,6 +196,18 @@ impl Gateway {
             ready,
             ready_sender,
         })
+    }
+
+    /// Swaps who may post and what starts a session, leaving the connection.
+    ///
+    /// Called on reload. The token and the served channel are deliberately
+    /// not carried over: moving those mid connection would split the daemon
+    /// across two channels with one foot in each.
+    pub fn reconfigure_membership(&self, config: &ChatConfig) {
+        let mut held = self.config.lock().expect("the gateway configuration lock");
+        held.allowed_user_ids.clone_from(&config.allowed_user_ids);
+        held.blocked_user_ids.clone_from(&config.blocked_user_ids);
+        held.start_on_mention = config.start_on_mention;
     }
 
     /// Waits for the connection to answer its handshake, no longer than the
@@ -230,16 +246,24 @@ impl Gateway {
 #[serenity::async_trait]
 impl EventHandler for Gateway {
     async fn message(&self, ctx: Context, message: Message) {
+        // Cloned out front: the filter must not hold the lock across the
+        // awaits below, and a reload swapping membership mid message would
+        // judge half of it under each list.
+        let chat = self
+            .config
+            .lock()
+            .expect("the gateway configuration lock")
+            .clone();
         let parent = parent_of(&ctx, message.channel_id).await;
         let raw = to_raw(&message, parent);
         let own = self.bot_id.lock().expect("the bot id lock").clone();
-        let decision = classify(&raw, &self.config, own.as_deref());
+        let decision = classify(&raw, &chat, own.as_deref());
         let InboundDecision::Ignore { reason } = &decision else {
             // The mention summoned the bot; it is not part of what was asked.
             // Taken out here, where the bot's own name is known, so nothing
             // downstream has to know it has one.
             let asked = if decision == InboundDecision::Start
-                && self.config.start_on_mention
+                && chat.start_on_mention
                 && let Some(own) = &own
             {
                 let mut without = raw.clone();
@@ -261,12 +285,17 @@ impl EventHandler for Gateway {
         let Some(command) = interaction.as_command().cloned() else {
             return;
         };
+        let chat = self
+            .config
+            .lock()
+            .expect("the gateway configuration lock")
+            .clone();
 
         // The same rule governs slash commands as messages. A blocked account
         // is answered exactly as an unauthorised one, so the two are
         // indistinguishable from outside. An interaction has to be answered
         // at all, or the service reports the bot as broken.
-        if !is_permitted(&self.config, command.user.id.get().to_string().as_str()) {
+        if !is_permitted(&chat, command.user.id.get().to_string().as_str()) {
             acknowledge(&ctx, &command, "you are not permitted to use this bot").await;
             return;
         }
@@ -319,6 +348,11 @@ impl EventHandler for Gateway {
         // A deletion arrives by id, and for anything older than the cache
         // that is nearly all it carries. `to_raw` is no use here: it is for
         // messages, and a deletion usually cannot be attributed.
+        let chat = self
+            .config
+            .lock()
+            .expect("the gateway configuration lock")
+            .clone();
         let parent = parent_of(&ctx, channel_id).await;
         let decision = classify_deletion(
             &RawDeletion {
@@ -326,7 +360,7 @@ impl EventHandler for Gateway {
                 channel_id: channel_id.get().to_string(),
                 parent_channel_id: parent.map(|channel| channel.get().to_string()),
             },
-            &self.config,
+            &chat,
         );
         match decision {
             DeletionDecision::Ignore { .. } => {}
@@ -355,7 +389,13 @@ impl EventHandler for Gateway {
         _old: Option<serenity::model::channel::GuildChannel>,
         new: serenity::model::channel::GuildChannel,
     ) {
-        if new.parent_id != Some(ChannelId::new(self.config.channel_id.parse().unwrap_or(0))) {
+        let served = self
+            .config
+            .lock()
+            .expect("the gateway configuration lock")
+            .channel_id
+            .clone();
+        if new.parent_id != Some(ChannelId::new(served.parse().unwrap_or(0))) {
             return;
         }
         let archived = new
@@ -374,7 +414,13 @@ impl EventHandler for Gateway {
         thread: serenity::model::channel::PartialGuildChannel,
         _full: Option<serenity::model::channel::GuildChannel>,
     ) {
-        if thread.parent_id.get().to_string() != self.config.channel_id {
+        if thread.parent_id.get().to_string()
+            != self
+                .config
+                .lock()
+                .expect("the gateway configuration lock")
+                .channel_id
+        {
             return;
         }
         (self.handlers.on_thread_closed)(thread.id.get().to_string());

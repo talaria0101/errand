@@ -1017,7 +1017,12 @@ async fn run(
         &fields([("channel", LogValue::from(config.chat.channel_id.as_str()))]),
     );
 
-    wait_for_signal().await;
+    loop {
+        match wait_for_event().await {
+            SignalEvent::Shutdown => break,
+            SignalEvent::Reload => attempt_reload(&daemon, &gateway, log).await,
+        }
+    }
 
     log.info(
         "shutting down",
@@ -1201,13 +1206,67 @@ async fn reply_in_channel(
     }
 }
 
-/// Waits for the signals that stop the daemon.
-async fn wait_for_signal() {
+/// What the process was told: stop, or re-read the configuration file.
+enum SignalEvent {
+    Shutdown,
+    Reload,
+}
+
+/// Waits for the signals that stop the daemon or reload it.
+///
+/// SIGHUP re-reads the configuration file and carries it to every live
+/// session without killing any of them. A file that fails validation keeps
+/// the running configuration, and structural settings wait for a restart,
+/// as the reload report says.
+async fn wait_for_event() -> SignalEvent {
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM is supported");
+    let mut sighup = signal(SignalKind::hangup()).expect("SIGHUP is supported");
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = sigterm.recv() => {}
+        _ = tokio::signal::ctrl_c() => SignalEvent::Shutdown,
+        _ = sigterm.recv() => SignalEvent::Shutdown,
+        _ = sighup.recv() => SignalEvent::Reload,
+    }
+}
+
+/// Re-reads the configuration file and carries it to every live session.
+///
+/// A file that fails validation keeps the running configuration: a reload
+/// must never trade a working daemon for a refused one.
+async fn attempt_reload(daemon: &Arc<Daemon>, gateway: &Arc<Gateway>, log: &Logger) {
+    use crate::config::reload::{classify, reload_config};
+    let old = daemon.sessions().current_config();
+    match reload_config() {
+        Err(error) => {
+            log.error(
+                &format!("reload refused, keeping the running configuration: {error}"),
+                &fields([]),
+            );
+        }
+        Ok(new) => {
+            let changed = classify(&old, &new);
+            if changed.is_empty() {
+                log.info("reload found nothing changed", &fields([]));
+                return;
+            }
+            gateway.reconfigure_membership(&new.chat);
+            let updated = daemon.reconfigure(new).await;
+            let summary = changed
+                .iter()
+                .map(|(path, tier)| format!("{path} ({})", tier.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            log.info(
+                "configuration reloaded",
+                &fields([
+                    ("changed", LogValue::from(summary)),
+                    (
+                        "sessions",
+                        LogValue::from(i64::try_from(updated).unwrap_or(i64::MAX)),
+                    ),
+                ]),
+            );
+        }
     }
 }
 

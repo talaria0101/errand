@@ -146,3 +146,53 @@ fn an_author_without_a_display_name_is_named_by_the_account() {
     let raw = to_raw(&message, None);
     assert_eq!(raw.author_name.as_deref(), Some("amelia1"));
 }
+
+/// A reload swaps who may post without touching the connection itself.
+#[test]
+fn reconfigure_membership_swaps_the_filter_leaving_the_connection() {
+    use std::sync::Arc;
+
+    use super::{Gateway, GatewayHandlers};
+    use crate::config::schema::ChatConfig;
+    use crate::log::{LogFields, Logger};
+
+    fn chat(blocked: Vec<String>) -> ChatConfig {
+        ChatConfig {
+            token: "a.token.value".to_owned(),
+            channel_id: "chan".to_owned(),
+            allowed_user_ids: vec!["100000000000000001".to_owned()],
+            blocked_user_ids: blocked,
+            operator_user_ids: Vec::new(),
+            start_on_mention: false,
+        }
+    }
+
+    fn handlers() -> GatewayHandlers {
+        GatewayHandlers {
+            on_message: Arc::new(|_, _| {}),
+            on_command: Arc::new(|_, _| {}),
+            on_thread_closed: Arc::new(|_| {}),
+            on_withdrawn: Arc::new(|_, _| {}),
+            on_connected: Arc::new(|| {}),
+            on_disconnected: Arc::new(|| {}),
+            on_gave_up: Arc::new(|_| {}),
+        }
+    }
+
+    let silent = || Logger::new(LogFields::new(), Arc::new(|_level, _line| {}));
+    let gateway = Gateway::new(chat(vec!["noisy".to_owned()]), handlers(), silent());
+
+    let mut open = chat(Vec::new());
+    open.channel_id = "elsewhere".to_owned();
+    open.start_on_mention = true;
+    gateway.reconfigure_membership(&open);
+
+    let held = gateway
+        .config
+        .lock()
+        .expect("the gateway configuration lock");
+    assert!(held.blocked_user_ids.is_empty());
+    assert!(held.start_on_mention);
+    assert_eq!(held.channel_id, "chan");
+    assert_eq!(held.token, "a.token.value");
+}

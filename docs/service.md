@@ -46,6 +46,36 @@ Both definitions restart a crash and refuse to restart a refusal. Exit 2, 3, and
 again; 4 would also mean fighting the daemon that is already serving. See
 [getting started](/start) for what each code means.
 
+## Reloading without restarting
+
+Send SIGHUP after editing the configuration file and the daemon re-reads it
+without killing any session:
+
+```sh
+systemctl reload errand
+```
+
+A file that fails validation keeps the running configuration, and the refusal
+is logged naming every problem. A valid file swaps what new sessions start
+from and is carried to every live session, which logs what changed and when
+each change lands:
+
+- **Live.** Read on every use, so running sessions pick it up at once.
+  Storage budgets lead here: raising `sandbox.disk` applies at the next disk
+  check, with no sandbox touch. Timeouts, output shaping, chat membership,
+  and the shutdown list are live too.
+- **Next launch.** Written into each fresh sandbox policy, so new sessions
+  and sandbox restarts pick it up while running sandboxes keep theirs.
+  Scratch and single file sizes live here: a tmpfs size is fixed at mount
+  and an rlimit at exec, so neither can move under a running agent. Raise
+  `sandbox.tmpSize` and the session that is full now still needs its one
+  automatic restart onto a fresh sandbox; the session after that starts
+  large.
+- **Restart.** Baked into objects built once at startup: the backend, the
+  image, the network and broker shape, the directories, admission caps, and
+  the chat connection. These are reported, not applied, until the daemon
+  restarts.
+
 ## Limits
 
 Both apply memory, cpu, and process limits to the daemon and everything it

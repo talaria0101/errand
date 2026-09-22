@@ -1613,3 +1613,25 @@ async fn a_bare_model_from_another_provider_launches_under_that_provider() {
     )
     .await;
 }
+
+/// A reload swaps what new sessions start from and reaches every live one.
+#[tokio::test]
+async fn reconfigure_reaches_new_sessions_and_live_ones() {
+    with_manager(|harness| {
+        Box::pin(async move {
+            let outcome = harness
+                .manager
+                .start(message("demo: fix the parser", "m1"))
+                .await;
+            assert!(outcome.is_started());
+
+            let mut config = config_with(harness.root.path(), &json!({}));
+            config.sandbox.disk = "10g".to_owned();
+            let updated = harness.manager.reconfigure(config).await;
+
+            assert_eq!(updated, 1);
+            assert_eq!(harness.manager.current_config().sandbox.disk, "10g");
+        })
+    })
+    .await;
+}

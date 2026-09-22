@@ -445,6 +445,11 @@ enum Signal {
     LastActive {
         reply: oneshot::Sender<i64>,
     },
+    Reconfigure {
+        config: Box<Config>,
+        operator_ids: Vec<String>,
+        reply: oneshot::Sender<()>,
+    },
     Timer {
         timer: SessionTimer,
         handle: u64,
@@ -588,6 +593,28 @@ impl SessionHandle {
         if self
             .commands
             .send(Signal::Stop { reason, reply })
+            .await
+            .is_ok()
+        {
+            let _ = answer.await;
+        }
+    }
+
+    /// Swaps the configuration a running session reads from.
+    ///
+    /// Measured limits such as the disk budget are read on every check, so
+    /// they go live at once. Anything baked into the running sandbox, sizes
+    /// and grants included, waits for the next launch, which already builds
+    /// its policy from this same configuration.
+    pub async fn reconfigure(&self, config: Config, operator_ids: Vec<String>) {
+        let (reply, answer) = oneshot::channel();
+        if self
+            .commands
+            .send(Signal::Reconfigure {
+                config: Box::new(config),
+                operator_ids,
+                reply,
+            })
             .await
             .is_ok()
         {
@@ -824,6 +851,14 @@ impl Running {
                 }
                 Signal::LastActive { reply } => {
                     let _ = reply.send(self.last_active);
+                }
+                Signal::Reconfigure {
+                    config,
+                    operator_ids,
+                    reply,
+                } => {
+                    self.apply_config(*config, operator_ids);
+                    let _ = reply.send(());
                 }
                 Signal::Timer { timer, handle } => self.on_timer(timer, handle).await,
                 Signal::Admitted {
@@ -2464,6 +2499,33 @@ impl Running {
         self.idle_timer = Some(
             self.timers
                 .set_timeout(SessionTimer::Idle, self.options.config.timeouts.idle_ms),
+        );
+    }
+
+    /// Swaps the running configuration for a reloaded one.
+    ///
+    /// Nothing here restarts the sandbox: measured limits are read on every
+    /// check and go live at once, while sizes and grants baked into the
+    /// running sandbox wait for the next launch. An ended session keeps its
+    /// ending rather than being revived by new numbers.
+    fn apply_config(&mut self, config: Config, operator_ids: Vec<String>) {
+        if self.ended {
+            return;
+        }
+        let changed = crate::config::reload::classify(&self.options.config, &config);
+        self.options.config = config;
+        self.options.operator_ids = operator_ids;
+        if changed.is_empty() {
+            return;
+        }
+        let summary = changed
+            .iter()
+            .map(|(path, tier)| format!("{path} ({})", tier.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.log.info(
+            "configuration reloaded",
+            &fields([("changed", LogValue::from(summary))]),
         );
     }
 
