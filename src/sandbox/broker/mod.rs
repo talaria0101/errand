@@ -100,7 +100,33 @@ pub fn parse_connect(request_line: &str) -> Option<ConnectTarget> {
 
 /// Ports the broker will open upstream, so a tunnel cannot reach a service on
 /// an odd port.
+///
+/// Kept for callers that do not name ports. New code gates on the per broker
+/// `allowed_ports` instead, which defaults to this and is set from
+/// `sandbox.egressPorts` where the daemon runs one.
 pub const ALLOWED_UPSTREAM_PORTS: [u16; 1] = [443];
+
+/// How long a broker DNS lookup may take before it is treated as a stall.
+///
+/// A lookup with no bound stalls the whole CONNECT, which the session only
+/// sees as a client timeout with no broker reply. Five seconds is long enough
+/// for a healthy resolver and short enough to stay inside a 20 second client
+/// budget with room left to try another address.
+pub const RESOLVE_TIMEOUT_MS: u64 = 5_000;
+
+/// How long one upstream dial may take before the next address is tried.
+///
+/// Seven seconds covers a slow SYN without letting one slow IP hold a burst
+/// hostage. Addresses race in parallel and the first success wins, so this is
+/// a per address ceiling rather than a sum.
+pub const DIAL_TIMEOUT_MS: u64 = 7_000;
+
+/// How long a provider request may take end to end.
+///
+/// The provider path had no timeout at all, so one slow upstream held the
+/// turn open. Sixty seconds matches a generous model round trip while still
+/// bounding the hang.
+pub const PROVIDER_TIMEOUT_SECS: u64 = 60;
 
 /// Where the model provider really is, and what stands in for its key.
 ///
@@ -311,6 +337,97 @@ pub fn is_private_address(address: &str) -> bool {
     }
 }
 
+/// A plain HTTP request through the proxy, as an absolute URI.
+///
+/// A proxy style line reads `GET http://host/path HTTP/1.1`. The broker dials
+/// the named host itself and relays, rather than tunneling. Only `http` is
+/// parsed here. An `https` absolute URI is left for the CONNECT path, and a
+/// relative origin form such as `GET /provider/...` is a provider call
+/// rather than an upstream fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpTarget {
+    /// The host the request names.
+    pub host: String,
+    /// The port to dial, 80 when the URI names none.
+    pub port: u16,
+    /// The origin form path to forward upstream, query included.
+    pub path: String,
+}
+
+/// Reads a plain HTTP proxy target out of a request line.
+///
+/// Returns nothing for CONNECT lines, for relative origin forms, and for
+/// anything that is not an `http` absolute URI. A port out of range or a
+/// missing path is refused the same way, by returning nothing rather than
+/// guessing at a target the allowlist cannot be said to have checked.
+pub fn parse_http_request(request_line: &str) -> Option<HttpTarget> {
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next()?;
+    let target = parts.next()?;
+    if method.eq_ignore_ascii_case("CONNECT") {
+        return None;
+    }
+    let rest = target.strip_prefix("http://")?;
+    if rest.is_empty() || rest.contains('[') {
+        return None;
+    }
+    let (authority, path) = match rest.find('/') {
+        Some(at) => (&rest[..at], &rest[at..]),
+        None => (rest, "/"),
+    };
+    if authority.is_empty() {
+        return None;
+    }
+    let (host, port) = match authority.rfind(':') {
+        Some(colon) => {
+            let host = &authority[..colon];
+            let port_text = &authority[colon + 1..];
+            if host.is_empty() || port_text.is_empty() {
+                return None;
+            }
+            let port: i64 = port_text.parse().ok()?;
+            if !(1..=65_535).contains(&port) {
+                return None;
+            }
+            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let port = port as u16;
+            (host.to_owned(), port)
+        }
+        None => (authority.to_owned(), 80),
+    };
+    if host.contains('/') || host.contains('@') {
+        return None;
+    }
+    Some(HttpTarget {
+        host,
+        port,
+        path: path.to_owned(),
+    })
+}
+
+/// Rewrites a proxy style head to the origin form the upstream expects.
+///
+/// Only the request line changes, from `METHOD http://host/path ...` to
+/// `METHOD /path ...`. Headers pass through untouched, so the Host the client
+/// sent is the Host the upstream sees.
+pub fn origin_form_head(head: &str, path: &str) -> String {
+    let mut lines = head.split('\n');
+    let first = lines.next().unwrap_or("");
+    let mut pieces = first.split_whitespace();
+    let method = pieces.next().unwrap_or("");
+    let version = pieces.nth(1).unwrap_or("HTTP/1.1");
+    let mut out = format!("{method} {path} {version}");
+    if !out.ends_with('\r') {
+        out.push('\r');
+    }
+    out.push('\n');
+    for line in lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 /// Resolves names to addresses, injected so a test answers from a table.
 pub type Resolve = Arc<dyn Fn(String) -> ResolveFuture + Send + Sync>;
 
@@ -332,28 +449,67 @@ pub async fn public_address(
     allow_internal: bool,
     resolve: Option<&Resolve>,
 ) -> Option<String> {
+    public_addresses(host, allow_internal, resolve)
+        .await
+        .into_iter()
+        .next()
+}
+
+/// Resolves a target to every address the broker may dial.
+///
+/// Same judging as [`public_address`], but returns all public hits rather
+/// than the first, so a dial can race them instead of stalling on one slow
+/// IP. Order follows the resolver. A literal returns at most itself.
+pub async fn public_addresses(
+    host: &str,
+    allow_internal: bool,
+    resolve: Option<&Resolve>,
+) -> Vec<String> {
     let literal = host.split('.').count() == 4 && host.parse::<std::net::Ipv4Addr>().is_ok()
         || host.contains(':');
     if literal {
         if !is_private_address(host) {
-            return Some(host.to_owned());
+            return vec![host.to_owned()];
         }
-        return allow_internal.then(|| host.to_owned());
+        if allow_internal {
+            return vec![host.to_owned()];
+        }
+        return Vec::new();
     }
     let addresses = match resolve {
-        Some(resolve) => resolve(host.to_owned()).await,
+        Some(resolve) => resolve_with_timeout(host, resolve).await,
         None => default_resolve(host).await,
     };
     addresses
         .into_iter()
-        .find(|address| !is_private_address(address))
+        .filter(|address| !is_private_address(address))
+        .collect()
+}
+
+async fn resolve_with_timeout(name: &str, resolve: &Resolve) -> Vec<String> {
+    let fut = resolve(name.to_owned());
+    tokio::time::timeout(std::time::Duration::from_millis(RESOLVE_TIMEOUT_MS), fut)
+        .await
+        .unwrap_or_default()
 }
 
 async fn default_resolve(name: &str) -> Vec<String> {
-    match tokio::net::lookup_host((name, 0_u16)).await {
-        Ok(addrs) => addrs.map(|addr| addr.ip().to_string()).collect(),
-        Err(_) => Vec::new(),
+    let lookup = tokio::net::lookup_host((name, 0_u16));
+    match tokio::time::timeout(std::time::Duration::from_millis(RESOLVE_TIMEOUT_MS), lookup).await {
+        Ok(Ok(addrs)) => addrs.map(|addr| addr.ip().to_string()).collect(),
+        _ => Vec::new(),
     }
+}
+
+/// Builds the HTTP client the broker forwards provider calls with.
+///
+/// A client with no timeout holds a turn open on one slow upstream. Sixty
+/// seconds bounds that hang while staying generous for a model round trip.
+pub(crate) fn provider_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(PROVIDER_TIMEOUT_SECS))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// What one broker shares across its connection tasks and its server.
@@ -372,6 +528,8 @@ pub(crate) struct ProviderState {
     pub provider_port: u16,
     /// The client that reaches the provider.
     pub client: reqwest::Client,
+    /// Upstream ports the broker may open, from `sandbox.egressPorts`.
+    pub allowed_ports: Vec<u16>,
 }
 
 /// Whether a request is served by the provider endpoint, per its path.

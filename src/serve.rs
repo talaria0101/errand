@@ -472,7 +472,8 @@ async fn start_broker(config: &Config, log: &Logger) -> Result<Option<Brokered>,
         log.clone(),
         routes.clone(),
         config.sandbox.egress.allow_internal,
-    );
+    )
+    .with_allowed_ports(config.sandbox.egress_ports.clone());
     // The listener sits on loopback; 169.254.169.1 is only what bailey
     // tells the sandbox to dial, mapped back to this host from inside.
     let proxy_port = match broker_instance.listen("127.0.0.1").await {

@@ -9,7 +9,8 @@ use tokio::net::TcpStream;
 
 use super::server::{Broker, read_request_head};
 use super::{
-    ProviderRoute, Resolve, host_allowed, is_private_address, parse_connect, public_address,
+    HttpTarget, ProviderRoute, Resolve, host_allowed, is_private_address, origin_form_head,
+    parse_connect, parse_http_request, public_address, public_addresses,
 };
 use crate::log::{LogFields, Logger};
 
@@ -555,6 +556,66 @@ async fn closing_the_broker_stops_it_accepting() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     panic!("the broker kept accepting after it was closed");
+}
+
+/// A plain HTTP absolute URI parses to its host, port, and origin path.
+#[test]
+fn a_plain_http_line_parses_to_host_port_and_path() {
+    assert_eq!(
+        parse_http_request("GET http://example.com/ HTTP/1.1"),
+        Some(HttpTarget {
+            host: "example.com".to_owned(),
+            port: 80,
+            path: "/".to_owned(),
+        })
+    );
+    assert_eq!(
+        parse_http_request("POST http://example.com:8080/a?b=c HTTP/1.1"),
+        Some(HttpTarget {
+            host: "example.com".to_owned(),
+            port: 8080,
+            path: "/a?b=c".to_owned(),
+        })
+    );
+    // CONNECT, relative provider paths, and https absolute URIs are not
+    // plain HTTP upstream fetches.
+    assert_eq!(parse_http_request("CONNECT example.com:443 HTTP/1.1"), None);
+    assert_eq!(parse_http_request("GET /provider/chat HTTP/1.1"), None);
+    assert_eq!(
+        parse_http_request("GET https://example.com/ HTTP/1.1"),
+        None
+    );
+    assert_eq!(parse_http_request("GET http:// HTTP/1.1"), None);
+    assert_eq!(
+        parse_http_request("GET http://example.com:99999/ HTTP/1.1"),
+        None
+    );
+}
+
+/// The upstream sees the origin form, not the absolute URI the proxy got.
+#[test]
+fn a_forwarded_head_carries_the_origin_form() {
+    let head = "GET http://example.com/a?b=c HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    let rewritten = origin_form_head(head, "/a?b=c");
+    let first = rewritten.split('\n').next().unwrap_or("");
+    assert_eq!(first.trim_end_matches('\r'), "GET /a?b=c HTTP/1.1");
+    assert!(rewritten.contains("Host: example.com"));
+}
+
+/// All public hits come back, so a dial can race them.
+#[tokio::test]
+async fn all_public_addresses_come_back_for_the_dial_to_race() {
+    let both = public_addresses(
+        "mixed.test",
+        false,
+        Some(&resolver(&["10.0.0.1", "9.9.9.9", "1.1.1.1"])),
+    )
+    .await;
+    assert_eq!(both, vec!["9.9.9.9".to_owned(), "1.1.1.1".to_owned()]);
+    assert_eq!(
+        public_addresses("10.0.0.5", false, None).await,
+        Vec::<String>::new()
+    );
 }
 
 /// A head that never ends is not a request. Handing back what accumulated

@@ -10,18 +10,22 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
 use super::{
-    ALLOWED_UPSTREAM_PORTS, ProviderRoute, ProviderState, host_allowed, parse_connect,
-    public_address,
+    ALLOWED_UPSTREAM_PORTS, DIAL_TIMEOUT_MS, ProviderRoute, ProviderState, host_allowed,
+    origin_form_head, parse_connect, parse_http_request, provider_client, public_addresses,
 };
 use crate::log::Logger;
 use crate::log::fields;
 
 /// A running CONNECT proxy that admits only allowlisted hosts.
+///
+/// Plain HTTP absolute URIs are forwarded through the same gate as CONNECT.
+/// Provider calls stay on their own terminating path.
 pub struct Broker {
     allow: Vec<String>,
     log: Logger,
     routes: Vec<ProviderRoute>,
     allow_internal: bool,
+    allowed_ports: Vec<u16>,
     accept_shutdown: Option<oneshot::Sender<()>>,
     provider_shutdown: Option<oneshot::Sender<()>>,
     closed: bool,
@@ -41,10 +45,22 @@ impl Broker {
             log,
             routes,
             allow_internal,
+            allowed_ports: ALLOWED_UPSTREAM_PORTS.to_vec(),
             accept_shutdown: None,
             provider_shutdown: None,
             closed: false,
         }
+    }
+
+    /// Upstream ports this broker may open, from `sandbox.egressPorts`.
+    ///
+    /// Defaults to 443 alone. Naming 80 admits plain HTTP forwarding through
+    /// the same allowlist gate as CONNECT.
+    pub fn with_allowed_ports(mut self, ports: Vec<u16>) -> Self {
+        if !ports.is_empty() {
+            self.allowed_ports = ports;
+        }
+        self
     }
 
     /// Binds to a loopback port and starts admitting connections. Returns the
@@ -67,7 +83,8 @@ impl Broker {
             log: self.log.clone(),
             resolve: None,
             provider_port,
-            client: reqwest::Client::new(),
+            client: provider_client(),
+            allowed_ports: self.allowed_ports.clone(),
         });
         let (shutdown_sender, mut shutdown_receiver) = oneshot::channel::<()>();
         tokio::spawn(async move {
@@ -100,7 +117,8 @@ impl Broker {
             log: self.log.clone(),
             resolve: None,
             provider_port: 0,
-            client: reqwest::Client::new(),
+            client: provider_client(),
+            allowed_ports: self.allowed_ports.clone(),
         });
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -135,52 +153,127 @@ impl Broker {
     }
 }
 
-/// Handles one client connection: gate, serve the provider, or refuse.
+/// Milliseconds since `started`, saturating rather than wrapping.
+fn millis_since(started: std::time::Instant) -> i64 {
+    i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
+}
+
+/// How many addresses were tried, saturating rather than wrapping.
+fn tried_count(addresses: &[String]) -> i64 {
+    i64::try_from(addresses.len()).unwrap_or(i64::MAX)
+}
+
+/// Dials the first reachable address, racing all candidates in parallel.
+///
+/// Each dial carries its own timeout and the first success wins, which is a
+/// Happy Eyeballs lite: one slow IP no longer stalls the whole CONNECT, and a
+/// host with both families races them. The rest are cancelled once one wins.
+async fn dial_race(addresses: &[String], port: u16) -> std::io::Result<TcpStream> {
+    if addresses.is_empty() {
+        return Err(std::io::Error::other("no address to dial"));
+    }
+    let mut joining = tokio::task::JoinSet::new();
+    for address in addresses {
+        let address = address.clone();
+        joining.spawn(async move {
+            let dial = tokio::net::TcpStream::connect((address.as_str(), port));
+            tokio::time::timeout(std::time::Duration::from_millis(DIAL_TIMEOUT_MS), dial).await
+        });
+    }
+    let mut last_error = std::io::Error::other("no address answered");
+    while let Some(outcome) = joining.join_next().await {
+        match outcome {
+            Ok(Ok(Ok(stream))) => {
+                joining.abort_all();
+                return Ok(stream);
+            }
+            Ok(Ok(Err(error))) => last_error = error,
+            Ok(Err(_elapsed)) => {
+                last_error = std::io::Error::new(std::io::ErrorKind::TimedOut, "dial timed out");
+            }
+            Err(error) => {
+                last_error = std::io::Error::other(error.to_string());
+            }
+        }
+    }
+    Err(last_error)
+}
+
+/// Handles one client connection: gate, forward, serve the provider, or refuse.
 async fn handle(stream: TcpStream, state: Arc<ProviderState>) {
+    let started = std::time::Instant::now();
     let (mut reader, mut writer) = stream.into_split();
     let Some(head) = read_request_head(&mut reader).await else {
         return;
     };
     let request_line = head.split('\n').next().unwrap_or("").to_owned();
-    let Some(target) = parse_connect(&request_line) else {
-        // Not a tunnel. With a provider route this is the session calling the
-        // provider, which is served rather than refused: the head already read
-        // is replayed so the server sees the request whole.
-        if !state.routes.is_empty() {
-            let _ = serve_provider(&mut reader, &mut writer, &head, state.provider_port).await;
-            return;
-        }
-        let _ = refuse(&mut writer, 400, "the broker speaks only CONNECT").await;
+    if let Some(target) = parse_connect(&request_line) {
+        tunnel(
+            &mut reader,
+            &mut writer,
+            &target.host,
+            target.port,
+            &state,
+            started,
+        )
+        .await;
         return;
-    };
-    if !ALLOWED_UPSTREAM_PORTS.contains(&target.port) || !host_allowed(&target.host, &state.allow) {
+    }
+    if let Some(target) = parse_http_request(&request_line) {
+        forward_http(&mut reader, &mut writer, &head, &target, &state, started).await;
+        return;
+    }
+    // Not a tunnel and not a plain HTTP absolute URI. With a provider route
+    // this is the session calling the provider on its relative path, which is
+    // served rather than refused: the head already read is replayed so the
+    // server sees the request whole.
+    if !state.routes.is_empty() {
+        let _ = serve_provider(&mut reader, &mut writer, &head, state.provider_port).await;
+        return;
+    }
+    let _ = refuse(&mut writer, 400, "the broker speaks CONNECT and plain http").await;
+}
+
+/// Opens a CONNECT tunnel after gating host, port, and resolved address.
+async fn tunnel(
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    host: &str,
+    port: u16,
+    state: &Arc<ProviderState>,
+    started: std::time::Instant,
+) {
+    if !state.allowed_ports.contains(&port) || !host_allowed(host, &state.allow) {
         state.log.info(
             "egress refused",
-            &fields([
-                ("host", target.host.as_str().into()),
-                ("port", i64::from(target.port).into()),
-            ]),
+            &fields([("host", host.into()), ("port", i64::from(port).into())]),
         );
-        let _ = refuse(&mut writer, 403, "not on the egress allowlist").await;
+        let _ = refuse(writer, 403, "not on the egress allowlist").await;
         return;
     }
 
     // Where the name actually points is checked, not just whether it is
     // allowed: the broker runs on the host, so dialling the host's own network
     // through it is a way back in that the namespace was built to close.
-    let address = public_address(&target.host, state.allow_internal, state.resolve.as_ref()).await;
-    let Some(address) = address else {
+    let resolve_started = std::time::Instant::now();
+    let addresses = public_addresses(host, state.allow_internal, state.resolve.as_ref()).await;
+    let resolve_ms = millis_since(resolve_started);
+    if addresses.is_empty() {
         state.log.warn(
-            "egress refused a host-internal target",
-            &fields([("host", target.host.as_str().into())]),
+            "egress refused a host-internal or unresolvable target",
+            &fields([
+                ("host", host.into()),
+                ("phase", "resolve".into()),
+                ("elapsed_ms", resolve_ms.into()),
+            ]),
         );
-        let _ = refuse(&mut writer, 403, "not a public host").await;
+        let _ = refuse(writer, 403, "not a public host").await;
         return;
-    };
+    }
 
-    let upstream = tokio::net::TcpStream::connect((address.as_str(), target.port)).await;
-    match upstream {
+    match dial_race(&addresses, port).await {
         Ok(upstream) => {
+            let total_ms = millis_since(started);
             if writer
                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 .await
@@ -191,21 +284,115 @@ async fn handle(stream: TcpStream, state: Arc<ProviderState>) {
             state.log.info(
                 "egress allowed",
                 &fields([
-                    ("host", target.host.as_str().into()),
-                    ("port", i64::from(target.port).into()),
+                    ("host", host.into()),
+                    ("port", i64::from(port).into()),
+                    ("phase", "dial".into()),
+                    ("resolve_ms", resolve_ms.into()),
+                    ("total_ms", total_ms.into()),
+                    ("tried", tried_count(&addresses).into()),
                 ]),
             );
             let (mut up_reader, mut up_writer) = upstream.into_split();
-            let outbound = tokio::io::copy(&mut reader, &mut up_writer);
-            let inbound = tokio::io::copy(&mut up_reader, &mut writer);
+            let outbound = tokio::io::copy(reader, &mut up_writer);
+            let inbound = tokio::io::copy(&mut up_reader, writer);
             let _ = tokio::join!(outbound, inbound);
         }
         Err(error) => {
-            let _ = refuse(&mut writer, 502, "upstream unreachable").await;
+            let total_ms = millis_since(started);
+            let _ = refuse(writer, 502, "upstream unreachable").await;
+            state.log.warn(
+                "upstream connect failed",
+                &fields([
+                    ("host", host.into()),
+                    ("phase", "dial".into()),
+                    ("resolve_ms", resolve_ms.into()),
+                    ("total_ms", total_ms.into()),
+                    ("tried", tried_count(&addresses).into()),
+                    ("detail", error.to_string().into()),
+                ]),
+            );
+        }
+    }
+}
+
+/// Forwards one plain HTTP request through the same gate as CONNECT.
+///
+/// The head is rewritten to origin form before it reaches the upstream, so
+/// the origin sees `GET /path` rather than the absolute URI the proxy was
+/// given. The body that follows the head streams through untouched, which is
+/// what carries a POST without parsing its length here.
+async fn forward_http(
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    head: &str,
+    target: &super::HttpTarget,
+    state: &Arc<ProviderState>,
+    started: std::time::Instant,
+) {
+    if !state.allowed_ports.contains(&target.port) || !host_allowed(&target.host, &state.allow) {
+        state.log.info(
+            "egress refused",
+            &fields([
+                ("host", target.host.as_str().into()),
+                ("port", i64::from(target.port).into()),
+                ("via", "http".into()),
+            ]),
+        );
+        let _ = refuse(writer, 403, "not on the egress allowlist").await;
+        return;
+    }
+    let resolve_started = std::time::Instant::now();
+    let addresses =
+        public_addresses(&target.host, state.allow_internal, state.resolve.as_ref()).await;
+    let resolve_ms = millis_since(resolve_started);
+    if addresses.is_empty() {
+        state.log.warn(
+            "egress refused a host-internal or unresolvable target",
+            &fields([
+                ("host", target.host.as_str().into()),
+                ("phase", "resolve".into()),
+                ("via", "http".into()),
+                ("elapsed_ms", resolve_ms.into()),
+            ]),
+        );
+        let _ = refuse(writer, 403, "not a public host").await;
+        return;
+    }
+    match dial_race(&addresses, target.port).await {
+        Ok(upstream) => {
+            let total_ms = millis_since(started);
+            state.log.info(
+                "egress allowed",
+                &fields([
+                    ("host", target.host.as_str().into()),
+                    ("port", i64::from(target.port).into()),
+                    ("via", "http".into()),
+                    ("phase", "dial".into()),
+                    ("resolve_ms", resolve_ms.into()),
+                    ("total_ms", total_ms.into()),
+                ]),
+            );
+            let (mut up_reader, mut up_writer) = upstream.into_split();
+            let origin = origin_form_head(head, &target.path);
+            if up_writer.write_all(origin.as_bytes()).await.is_err() {
+                let _ = refuse(writer, 502, "upstream unreachable").await;
+                return;
+            }
+            let outbound = tokio::io::copy(reader, &mut up_writer);
+            let inbound = tokio::io::copy(&mut up_reader, writer);
+            let _ = tokio::join!(outbound, inbound);
+        }
+        Err(error) => {
+            let total_ms = millis_since(started);
+            let _ = refuse(writer, 502, "upstream unreachable").await;
             state.log.warn(
                 "upstream connect failed",
                 &fields([
                     ("host", target.host.as_str().into()),
+                    ("via", "http".into()),
+                    ("phase", "dial".into()),
+                    ("resolve_ms", resolve_ms.into()),
+                    ("total_ms", total_ms.into()),
                     ("detail", error.to_string().into()),
                 ]),
             );
