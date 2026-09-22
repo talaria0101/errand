@@ -191,6 +191,28 @@ fn the_configured_limits_reach_the_container() {
     assert!(args.contains("--pids-limit 128"));
 }
 
+/// Scratch is a sized tmpfs by default, so a build is not held to the
+/// runtime default, and shm carries its configured size too.
+#[test]
+fn scratch_sizes_reach_the_container_as_tmpfs_and_shm() {
+    let args = podman_args(&config(), &launch()).join(" ");
+    let tmp_bytes = parse_size("2g").expect("bytes");
+    assert!(args.contains(&format!("--tmpfs /tmp:size={tmp_bytes},mode=1777")));
+    assert!(args.contains("--shm-size 1g"));
+}
+
+/// With diskTmp the state tmp directory is bound at /tmp instead of a tmpfs,
+/// so scratch is on disk and counted by the disk budget.
+#[test]
+fn disk_tmp_binds_the_state_tmp_directory_at_tmp() {
+    let mut disk = config();
+    disk.disk_tmp = true;
+    let args = podman_args(&disk, &launch()).join(" ");
+    assert!(args.contains("/state/s-1/tmp:/tmp:rw,Z"));
+    assert!(!args.contains("--tmpfs /tmp"));
+    assert!(args.contains("--shm-size 1g"));
+}
+
 /// The runtime takes bytes, so a size that validated must convert.
 #[test]
 fn the_file_ceiling_is_passed_as_bytes_not_as_it_was_written() {

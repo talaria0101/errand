@@ -1,6 +1,6 @@
 //! Tests for path containment, ported from `paths_test.ts`.
 
-use super::{host_path_under, read_beneath, truncate_beneath, within};
+use super::{clear_dir_contents, host_path_under, read_beneath, truncate_beneath, within};
 
 const ROOT: &str = "/projects/demo";
 
@@ -168,5 +168,31 @@ fn truncating_through_a_link_leaves_the_target_alone() {
     assert_eq!(
         std::fs::read_to_string(root.path().join("plain.md")).expect("read back"),
         ""
+    );
+}
+
+/// Clearing scratch removes its entries without following a planted link.
+#[test]
+fn clearing_scratch_empties_the_dir_and_not_what_a_link_points_at() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let outside = tempfile::tempdir().expect("a temporary directory");
+    let target = outside.path().join("keep");
+    std::fs::write(&target, "must survive").expect("written");
+    std::fs::write(dir.path().join("spent.tmp"), "spent").expect("written");
+    std::fs::create_dir(dir.path().join("nested")).expect("nested");
+    std::fs::write(dir.path().join("nested").join("deep.tmp"), "deep").expect("written");
+    std::os::unix::fs::symlink(&target, dir.path().join("hop")).expect("linked");
+
+    clear_dir_contents(&dir.path().display().to_string()).expect("cleared");
+
+    assert!(
+        std::fs::read_dir(dir.path())
+            .expect("listed")
+            .next()
+            .is_none()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("read back"),
+        "must survive"
     );
 }

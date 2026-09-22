@@ -189,6 +189,19 @@ const MAX_DIFFABLE_BYTES: u64 = 512 * 1024;
 /// ending otherwise reads as final, and the recovery went unnoticed.
 const CONTINUE_HINT: &str = "Post here to continue on a fresh sandbox.";
 
+/// How many times a session restarts itself after scratch exhaustion.
+///
+/// One fresh sandbox clears a filled `/tmp`, whether tmpfs or a cleared disk
+/// directory. A second immediate fill means the work needs more than a fresh
+/// scratch, so the session ends with the knob names instead of looping.
+const MAX_SCRATCH_RESTARTS: u32 = 1;
+
+/// Whether text reports scratch exhaustion rather than another failure.
+fn is_scratch_full(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("enospc") || lower.contains("no space left on device")
+}
+
 /// Tool outputs kept so a delegation can name one, newest first.
 const MAX_REMEMBERED_OUTPUTS: usize = 50;
 
@@ -673,6 +686,8 @@ struct Running {
     aborting: bool,
     /// An interruption already asked for and not yet answered.
     abort_in_flight: bool,
+    /// How many times the sandbox was restarted after scratch exhaustion.
+    scratch_restarts: u32,
 
     /// Who has already been told why they cannot take part.
     explained: HashSet<String>,
@@ -744,6 +759,7 @@ impl Running {
             aborting: false,
             abort_in_flight: false,
             abort_timer: None,
+            scratch_restarts: 0,
             sandbox: None,
             client: None,
             ticket: None,
@@ -1014,41 +1030,41 @@ impl Running {
         }
     }
 
-    async fn start(&mut self, first: IncomingMessage) -> bool {
-        let github = self.options.config.github.clone();
-        self.write_git_config(github.as_ref());
-        self.write_agent_bin(github.as_ref());
-        let system_prompt_path = self.write_memory_block();
-
+    /// Environment the agent is launched with: provider credential, GitHub
+    /// token, and the offline pin for extension catalogs. Built per launch so
+    /// a restart carries the same secrets as the first start.
+    fn launch_env(&self) -> BTreeMap<String, String> {
         let mut env = BTreeMap::new();
         let agent = &self.options.config.agent;
-        // The provider this session starts on, which a named model or a
-        // switch may have made a different one from the standing default. A
-        // key for the provider it is not talking to reaches nothing.
+        // The provider this session runs on. A key for one it is not talking
+        // to reaches nothing.
         let starting = self.provider();
         if let Some(name) = agent.credential_name_of(&starting)
             && let Some(credential) = agent.credential_of(&starting)
         {
             env.insert(name.to_owned(), credential.to_owned());
         }
-        if let Some(github) = &github {
-            // The GitHub token crosses too. Reading issues and leaving
-            // comments is most of working on somebody's repository, and none
-            // of it is possible without one. Pull requests are still composed
-            // by the daemon.
+        // The GitHub token crosses too. Pull requests stay composed by the
+        // daemon, but reading issues needs it inside.
+        if let Some(github) = &self.options.config.github {
             env.insert(TOKEN_VARIABLE.to_owned(), github.token.clone());
             for (name, value) in git_identity_env(github) {
                 env.insert(name, value);
             }
         }
-
-        // A fresh agent directory each session means pi's model-catalog
-        // cache never survives, so it would refetch every launch. Extensions
-        // pin their own catalog, so startup network is turned off: it stops
-        // the per-launch refresh without touching the turn's own requests.
+        // Extensions pin their own model catalog, so startup network is off.
         if !self.options.config.agent.extensions.is_empty() {
             env.insert("PI_OFFLINE".to_owned(), "1".to_owned());
         }
+        env
+    }
+
+    async fn start(&mut self, first: IncomingMessage) -> bool {
+        let github = self.options.config.github.clone();
+        self.write_git_config(github.as_ref());
+        self.write_agent_bin(github.as_ref());
+        let system_prompt_path = self.write_memory_block();
+        let env = self.launch_env();
 
         let launch = SandboxLaunch {
             session_id: self.options.id.clone(),
@@ -1905,6 +1921,96 @@ impl Running {
         None
     }
 
+    /// Restarts the sandbox after scratch exhaustion, keeping the session.
+    ///
+    /// A filled `/tmp` dies with its sandbox: tmpfs is discarded with the
+    /// namespace and a disk backed tmp is cleared on the next launch. The
+    /// agent history lives in the state directory, so relaunching with resume
+    /// keeps the conversation while the scratch starts empty. Returns true
+    /// when the session is alive on a fresh sandbox, false when the caller
+    /// should end it instead. At most one restart: a second immediate fill
+    /// means the work needs a larger scratch, not another fresh one.
+    async fn restart_sandbox_for_scratch(&mut self) -> bool {
+        if self.scratch_restarts >= MAX_SCRATCH_RESTARTS {
+            return false;
+        }
+        self.scratch_restarts += 1;
+        self.log.warn(
+            "scratch exhausted, restarting on a fresh sandbox",
+            &fields([("attempt", LogValue::from(i64::from(self.scratch_restarts)))]),
+        );
+        self.settle_turn(ReactionOutcome::Failed).await;
+        if let Some(sandbox) = &self.sandbox {
+            let _ = (sandbox.stop)().await;
+        }
+        self.sandbox = None;
+        self.client = None;
+
+        let github = self.options.config.github.clone();
+        self.write_git_config(github.as_ref());
+        self.write_agent_bin(github.as_ref());
+        let system_prompt_path = self.write_memory_block();
+        let launch = SandboxLaunch {
+            session_id: self.options.id.clone(),
+            project_path: self.options.project.path.clone(),
+            state_dir: self.options.state_dir.clone(),
+            env: self.launch_env(),
+            provider: self.provider(),
+            model: self.model(),
+            providers: self.options.config.agent.providers.clone(),
+            extensions: self.options.config.agent.extensions.clone(),
+            system_prompt_path,
+            resume: true,
+        };
+        let sandbox = match (self.options.launcher)(launch).await {
+            Ok(sandbox) => sandbox,
+            Err(error) => {
+                self.say(&format!(
+                    "scratch filled and the sandbox could not be restarted: {}",
+                    reason(&error)
+                ))
+                .await;
+                return false;
+            }
+        };
+        self.sandbox = Some(sandbox);
+        let client = AgentClient::new(
+            self.sandbox
+                .as_ref()
+                .expect("the sandbox was just relaunched")
+                .process
+                .clone(),
+            self.build_handlers(),
+            self.log.clone(),
+            self.options.config.timeouts.question_ms,
+            None,
+        );
+        tokio::spawn({
+            let client = client.clone();
+            async move {
+                client.run().await;
+            }
+        });
+        self.client = Some(client);
+        if let Err(error) = self
+            .client
+            .as_ref()
+            .expect("the client was just remade")
+            .wait_until_ready(self.options.config.timeouts.startup_ms)
+            .await
+        {
+            self.say(&format!(
+                "scratch filled and the restarted agent did not become ready: {error}"
+            ))
+            .await;
+            return false;
+        }
+        self.reset_idle_timer();
+        self.say("scratch filled, so this session restarted on a fresh sandbox. Retry what failed; if it fills again, raise sandbox.tmpSize, sandbox.shmSize, or sandbox.fileMax, or enable sandbox.diskTmp.")
+            .await;
+        true
+    }
+
     async fn on_exit(&mut self, code: i64) {
         if self.ended {
             return;
@@ -1914,6 +2020,9 @@ impl Running {
             .client
             .as_ref()
             .map_or_else(String::new, AgentClient::dying_words);
+        if is_scratch_full(&words) && self.restart_sandbox_for_scratch().await {
+            return;
+        }
         if let Some(named) = Self::diagnose(&words) {
             self.end_because(
                 EndReason::ResourceLimit,

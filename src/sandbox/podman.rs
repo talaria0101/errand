@@ -58,8 +58,6 @@ pub fn podman_args(config: &SandboxConfig, launch: &SandboxLaunch) -> Vec<String
         &format!("{SESSION_LABEL}={}", launch.session_id),
         "--userns=keep-id",
         "--read-only",
-        "--tmpfs",
-        "/tmp",
         "--volume",
         &format!("{}:{WORKSPACE_PATH}:rw,Z", launch.project_path),
         "--volume",
@@ -79,7 +77,25 @@ pub fn podman_args(config: &SandboxConfig, launch: &SandboxLaunch) -> Vec<String
     .collect();
 
     // The runtime takes what was written, said the way a number says itself.
+    // The value follows its flag at once, so a later insertion cannot split
+    // the pair a test reads as one string.
     args.push(format!("{}", config.cpus));
+    // Scratch lives where the budget can see it. With disk_tmp the host
+    // directory under the state tree is bound at /tmp instead of a tmpfs, so
+    // /tmp is on disk and counted by the disk watcher. Otherwise /tmp stays a
+    // tmpfs sized from tmp_size, and /dev/shm from shm_size, so a build that
+    // unpacks under /tmp is not held to the runtime default.
+    if config.disk_tmp {
+        args.push("--volume".to_owned());
+        args.push(format!("{}/tmp:/tmp:rw,Z", launch.state_dir));
+    } else {
+        let tmp_bytes = parse_size(&config.tmp_size).unwrap_or(0);
+        args.push("--tmpfs".to_owned());
+        args.push(format!("/tmp:size={tmp_bytes},mode=1777"));
+    }
+    args.push("--shm-size".to_owned());
+    args.push(config.shm_size.clone());
+
     args.push("--pids-limit".to_owned());
     args.push(config.pids.to_string());
     // An fsize ulimit, in bytes, inherited by every process in the container.
@@ -237,6 +253,14 @@ impl PodmanSandbox {
 
     /// Starts one session's sandbox.
     pub fn launch(&self, launch: &SandboxLaunch) -> Result<SandboxHandle, SandboxLaunchError> {
+        if self.config.disk_tmp {
+            // Bound at /tmp, so it has to exist before the container starts.
+            // Cleared as well, so a resume after scratch exhaustion starts
+            // empty rather than carrying the fill forward.
+            let tmp = format!("{}/tmp", launch.state_dir);
+            crate::sandbox::paths::clear_dir_contents(&tmp)
+                .map_err(|error| SandboxLaunchError(error.to_string()))?;
+        }
         let name = sandbox_name(&launch.session_id);
         let args = podman_args(&self.config, launch);
         let spawned = spawn_agent("podman", &args, None, None)

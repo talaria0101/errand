@@ -232,6 +232,28 @@ pub fn truncate_beneath(root: &str, relative: &str) -> std::io::Result<()> {
     open_beneath(root, relative, &OpenOptions::truncate()).map(|_| ())
 }
 
+/// Empties a scratch directory the daemon owns, creating it when missing.
+///
+/// Entries are removed without following them, so a link planted inside
+/// removes the link rather than what it points at. A directory entry goes via
+/// `remove_dir_all`, which a session cannot redirect outside this directory
+/// because each entry is removed by the host path read from this directory
+/// itself. Best effort per entry: one unreadable entry does not keep the rest.
+pub fn clear_dir_contents(dir: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let entries = std::fs::read_dir(dir)?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+        if is_dir {
+            let _ = std::fs::remove_dir_all(&path);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    Ok(())
+}
+
 /// Writes `bytes` to a file beneath `root`, replacing what was there.
 ///
 /// The daemon writes into trees a session can also write, so the name is

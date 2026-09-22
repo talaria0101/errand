@@ -33,6 +33,28 @@ bailey backend enforces this in the generated policy; podman bounds the network
 by namespace rather than by port, so the list is inert there. A session with
 `network` set to `none` opens nothing, whatever ports are named.
 
+## Proxied egress
+
+With `sandbox.egress.mode` set to `proxy`, every session dials out through a
+broker the daemon runs on the host. The broker gates CONNECT tunnels and plain
+HTTP forwarding by the same rule: host on `sandbox.egress.allow`, port in
+`sandbox.egressPorts`, and a resolved address that is not host internal. A
+plain `http://` URL is forwarded, not refused, so `HTTP_PROXY` points at the
+same broker as `HTTPS_PROXY`.
+
+Inside the proxy namespace ICMP, UDP, and DNS are absent by design, and only
+the broker address and port are reachable. A client timeout with no broker
+status line means resolve or dial stalled above the namespace, not the local
+link. Each session carries `ERRAND_EGRESS_VIA`, `ERRAND_EGRESS_PORTS`, and
+`ERRAND_EGRESS_NOTE`, so the broker and the allowed ports can be read from
+inside without host access. The daemon log records per attempt resolve and
+dial timings, which is what settles pasta versus DNS versus upstream on the
+first report.
+
+The broker races all resolved addresses with a bounded dial, so one slow IP
+does not stall the whole CONNECT, and provider calls carry a bounded request
+timeout rather than hanging a turn open.
+
 Under the bailey backend a session shares the host's network namespace, so it
 can read the host address, the MAC, and the ARP neighbours through `ip`,
 `/proc/net`, or `/sys`. To hide them, set `sandbox.hideHostAddress`:
@@ -169,6 +191,20 @@ and so is the name carrying the provider credential. A name the daemon sets
 itself keeps the daemon's value, so nothing here can decide what the agent
 authenticates as. The names given are reported at startup; the values are not,
 and a value reaches the agent, so nothing secret belongs here.
+
+## Scratch space
+
+A session gets a private `/tmp` and `/dev/shm`. With `sandbox.diskTmp` off,
+`/tmp` is a memory backed tmpfs sized by `sandbox.tmpSize`. With it on, a
+directory under the session state is bound at `/tmp` instead, so scratch is on
+disk and counted by the disk budget. Either way the host `/tmp` stays masked.
+The podman backend honors the same settings: a sized tmpfs, a sized shm, or a
+state backed `/tmp` when `diskTmp` is on.
+
+When the agent dies for want of scratch, with ENOSPC in its last words, the
+session restarts itself once on a fresh sandbox and keeps its history, then
+invites a retry. A second immediate fill ends the session with the knob names,
+since the work needs a larger scratch rather than another fresh one.
 
 ## What is not confined
 

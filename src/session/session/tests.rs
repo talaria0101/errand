@@ -1728,13 +1728,35 @@ async fn help_is_listed_without_troubling_the_agent() {
     .await;
 }
 
-/// ENOSPC in a sandbox is the session's own scratch, not the host disk, so
-/// the message names its limits and the knobs rather than a code, and never
-/// blames the host, which sends operators to `df` on a host with room.
+/// ENOSPC in a sandbox is the session's own scratch, not the host disk. The
+/// first fill restarts the session on a fresh sandbox and keeps its history;
+/// only a second immediate fill ends it with the knob names, since the work
+/// needs a larger scratch rather than another fresh one.
 #[tokio::test]
-async fn an_agent_that_died_for_want_of_disk_says_so_not_just_a_code() {
+async fn an_agent_that_died_for_want_of_disk_restarts_once_then_says_so() {
+    use serde_json::json;
     with_session(SessionTestCase::default(), |harness| {
         Box::pin(async move {
+            harness
+                .controls()
+                .complain("Error: ENOSPC: no space left on device, write");
+            settle().await;
+            harness.controls().end(1);
+            settle().await;
+            // The restart relaunches with resume and waits for ready.
+            harness
+                .controls()
+                .answer(&json!({ "model": { "contextWindow": 200_000 } }));
+            settle().await;
+
+            assert_eq!(harness.sandbox.launched.lock().unwrap().len(), 2);
+            assert!(harness.sandbox.launched.lock().unwrap()[1].resume);
+            assert!(!harness.session.is_ended().await);
+            assert!(
+                harness.thread.everything().contains("fresh sandbox"),
+                "says it restarted"
+            );
+
             harness
                 .controls()
                 .complain("Error: ENOSPC: no space left on device, write");

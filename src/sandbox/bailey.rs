@@ -487,6 +487,28 @@ impl BaileySandbox {
         // broker, reaches nothing under the netns lockdown, and stalls on the
         // provider.
         base.insert("NODE_USE_ENV_PROXY".to_owned(), "1".to_owned());
+        // Session visible egress signal, so a client timeout can be attributed
+        // without host access. Names the broker and the upstream ports the
+        // broker may open. ICMP, UDP, and DNS are absent inside by design;
+        // a timeout with no broker status line means resolve or dial stalled
+        // above the netns, not the local link.
+        base.insert(
+            "ERRAND_EGRESS_VIA".to_owned(),
+            format!("{EGRESS_MAP_ADDRESS}:{port}"),
+        );
+        let ports = self
+            .config
+            .egress_ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        base.insert("ERRAND_EGRESS_PORTS".to_owned(), ports);
+        base.insert(
+            "ERRAND_EGRESS_NOTE".to_owned(),
+            "proxy mode: CONNECT plus plain http on allowed ports only; ICMP UDP DNS absent; no broker reply means resolve or dial stalled"
+                .to_owned(),
+        );
         Some(base)
     }
 
@@ -635,9 +657,15 @@ impl BaileySandbox {
             .map_err(|error| SandboxLaunchError(error.to_string()))?;
         if self.config.disk_tmp {
             // The grant and TMPDIR point here, so it has to exist before the
-            // policy is applied.
-            tokio::fs::create_dir_all(std::path::Path::new(&launch.state_dir).join("tmp"))
-                .await
+            // policy is applied. Cleared as well, so a resume after scratch
+            // exhaustion starts on an empty /tmp rather than the fill that
+            // stopped the last sandbox. Synchronous and bounded: this is a
+            // scratch directory, and entries are unlinked without following.
+            let tmp = std::path::Path::new(&launch.state_dir)
+                .join("tmp")
+                .to_string_lossy()
+                .into_owned();
+            crate::sandbox::paths::clear_dir_contents(&tmp)
                 .map_err(|error| SandboxLaunchError(error.to_string()))?;
         }
         self.write_provider_override(launch)
